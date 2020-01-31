@@ -1,6 +1,4 @@
 // export SAMLTrace namespace to make ao. Request definitions available
-var browser = browser || chrome
-
 var EXPORTED_SYMBOLS = ["SAMLTrace"];
 
 if ("undefined" == typeof(SAMLTrace)) {
@@ -25,6 +23,14 @@ SAMLTrace.b64inflate = function (data) {
   var decoded = atob(data);
   var inflated = pako.inflateRaw(decoded);
   return String.fromCharCode.apply(String, inflated);
+};
+
+SAMLTrace.b64DecodeUnicode = function(str) {
+  // Taken from: https://developer.mozilla.org/en-US/docs/Web/API/WindowBase64/Base64_encoding_and_decoding
+  // Going backwards: from bytestream, to percent-encoding, to original string.
+  return decodeURIComponent(atob(str).split('').map(function(c) {
+    return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+  }).join(''));
 };
 
 SAMLTrace.bin2hex = function(s) {
@@ -61,15 +67,6 @@ SAMLTrace.prettifyXML = function(xmlstring) {
     return true;
   }
 
-  function xmlEntities(string) {
-    string = string.replace('&', '&amp;', 'g');
-    string = string.replace('"', '&quot;', 'g');
-    string = string.replace("'", '&apos;', 'g');
-    string = string.replace('<', '&lt;', 'g');
-    string = string.replace('>', '&gt;', 'g');
-    return string;
-  }
-
   function prettifyElement(element, indentation) {
     var ret = indentation + '<' + element.nodeName;
 
@@ -85,7 +82,7 @@ SAMLTrace.prettifyXML = function(xmlstring) {
       if (i > 0) {
         ret += '\n' + attrIndent;
       }
-      ret += ' ' + a.nodeName + '="' + xmlEntities(a.value) + '"';
+      ret += ' ' + a.nodeName + '="' + a.value + '"';
     }
 
     if (isEmptyElement(element)) {
@@ -105,7 +102,7 @@ SAMLTrace.prettifyXML = function(xmlstring) {
     }
 
     if (isTextElement(element)) {
-      return ret + xmlEntities(element.textContent) + '</' + element.nodeName + '>\n';
+      return ret + element.textContent + '</' + element.nodeName + '>\n';
     }
 
     ret += '\n';
@@ -126,13 +123,14 @@ SAMLTrace.prettifyArtifact = function(artstring) {
       'Source ID: ' + SAMLTrace.bin2hex(artifact.substr(4,20));
 };
 
-SAMLTrace.UniqueRequestId = function(webRequestId, url) {
+SAMLTrace.UniqueRequestId = function(webRequestId, method, url) {
   this.webRequestId = webRequestId;
+  this.method = method;
   this.url = url;
 };
 SAMLTrace.UniqueRequestId.prototype = {
   'create' : function(onCreated) {
-    Hash.calculate(this.url).then(digest => onCreated("request-" + this.webRequestId + "-" + digest));
+    Hash.calculate(this.url).then(digest => onCreated("request-" + this.webRequestId + "-" + this.method + "-" + digest));
   }
 };
 
@@ -146,6 +144,7 @@ SAMLTrace.Request = function(request, getResponse) {
   this.loadGET();
   this.loadPOST(request);
   this.parsePOST();
+  this.parseProtocol();
   this.parseSAML();
 };
 SAMLTrace.Request.prototype = {
@@ -192,12 +191,46 @@ SAMLTrace.Request.prototype = {
       return;
     }
 
-    const isTracedRequest = req => req.requestBody && req.requestBody.formData;
+    const isTracedParsedRequest = req => req.requestBody && req.requestBody.formData;
+    const isTracedRawRequest = req => req.requestBody && req.requestBody.raw;
     const isImportedRequest = req => req.requestBody && req.requestBody.post && request.req.requestBody.post.length;
 
-    if (isTracedRequest(request.req)) {
+    const isFormUrlEncoded = request => {
+      let contentTypeHeader = request.headers.find(header => header.name.toLowerCase() === "content-type");
+      return contentTypeHeader && contentTypeHeader.value.toLowerCase() === "application/x-www-form-urlencoded";
+    };
+
+    const rawRequestToString = rawByteArray => {
+      let postString = "";
+      rawByteArray.forEach(element => {
+        let chunk = String.fromCharCode.apply(null, new Uint8Array(element.bytes));
+        postString += chunk;
+      });
+      return postString;
+    };
+
+    const postStringToFormDataObject = parsedPostString => {
+      let parameters = parsedPostString.split('&');
+      let formData = {};
+      parameters.forEach(parameter => {
+        let splittedParameter = parameter.split('=');
+        let name = splittedParameter[0];
+        // In theory the formData's values should remain urlencoded. But since the webRequest-API's 
+        // formData-object supplies these values decoded, we try to mime the same behaviour here.
+        let value = decodeURIComponent((splittedParameter[1] || '').replace(/\+/g, '%20'));
+        formData[name] = [ value ];
+      });
+      return formData;
+    };
+
+    if (isTracedParsedRequest(request.req)) {
       // if it's an actively traced request, we have to look up its formData and parse it later on.
       this.postData = request.req.requestBody.formData;
+    } else if (isTracedRawRequest(request.req) && isFormUrlEncoded(request)) {
+      // Chrome parses a request only up to a size of 4096 bytes as formData. If the POST exceeds 
+      // this size, its raw bytes have to be parsed manually.
+      let postString = rawRequestToString(request.req.requestBody.raw);
+      this.postData = postStringToFormDataObject(postString);
     } else if (isImportedRequest(request.req)) {
       // if the request comes from an import, the parsed post-array and probably a token are already present.
       this.post = request.req.requestBody.post;
@@ -220,57 +253,78 @@ SAMLTrace.Request.prototype = {
       }
     }
   },
-  'parseSAML' : function() {
-    const findParameter = function(name, collection) {
-      if (!collection) {
-        return null;
-      }
-      
-      let parameter = collection.find(item => item[0] === name);
-      return parameter ? parameter[1] : null;
+  'parseProtocol' : function() {
+    const isParameterInCollection = (parameter, collection) => {
+      return collection.findIndex(item => item[0] === parameter) !== -1;
     };
 
-    if (this.saml && this.saml !== "") {
+    const isAnyParameterInCollection = (parameters, collection) => {
+      if (!collection) {
+        return false;
+      }
+      return parameters.some(parameter => isParameterInCollection(parameter, collection));
+    };
+
+    const isSamlProtocol = () => {
+      const parameters = ["SAMLRequest", "SAMLResponse", "SAMLart"];
+      let isInGet = isAnyParameterInCollection(parameters, this.get);
+      let isInPost = isAnyParameterInCollection(parameters, this.post);
+      return isInGet || isInPost;
+    };
+    
+    const isWsFederation = () => {
+      // all probably relevant WS-Federation parameters -> ["wa", "wreply", "wres", "wctx", "wp", "wct", "wfed", "wencoding", "wtrealm", "wfresh", "wauth", "wreq", "whr", "wreqptr", "wresult", "wresultptr", "wattr", "wattrptr", "wpseudo", "wpseudoptr"];
+      // the most common ones should suffice:
+      const parameters = ["wa", "wreply", "wctx", "wtrealm", "whr", "wresult"];
+      let isInGet = isAnyParameterInCollection(parameters, this.get);
+      let isInPost = isAnyParameterInCollection(parameters, this.post);
+      return isInGet || isInPost;
+    };
+
+    if (isSamlProtocol()) {
+      this.protocol = "SAML-P";
+    } else if (isWsFederation()) {
+      this.protocol = "WS-Fed";
+    }
+  },
+  'parseSAML' : function() {
+    if ((this.saml && this.saml !== "") || (this.samlart && this.samlart !== "")) {
       // do nothing if the token of an imported request is already present
       return;
     }
 
-    var msg = findParameter('SAMLRequest', this.get);
-    if (msg == null) {
-      msg = findParameter('SAMLResponse', this.get);
-    }
-    if (msg != null) {
-      this.saml = SAMLTrace.b64inflate(msg);
-      return;
+    const returnValueAsIs = msg => msg;
+    const returnValueB64Inflated = msg => !msg ? null : SAMLTrace.b64inflate(msg);
+    const returnValueWithRemovedWhitespaceAndAtoB = msg => !msg ? null : SAMLTrace.b64DecodeUnicode(msg.replace(/\s/g, ''));
+
+    let queries = [];
+    if (this.protocol === "SAML-P") {
+      queries = [
+        { name: 'SAMLRequest', collection: this.get, action: returnValueB64Inflated, to: result => this.saml = result},
+        { name: 'SAMLResponse', collection: this.get, action: returnValueB64Inflated, to: result => this.saml = result },
+        { name: 'SAMLart', collection: this.get, action: returnValueAsIs, to: result => this.samlart = result },
+        { name: 'SAMLRequest', collection: this.post, action: returnValueWithRemovedWhitespaceAndAtoB, to: result => this.saml = result },
+        { name: 'SAMLResponse', collection: this.post, action: returnValueWithRemovedWhitespaceAndAtoB, to: result => this.saml = result },
+        { name: 'SAMLart', collection: this.post, action: returnValueAsIs, to: result => this.samlart = result }
+      ];
+    } else if (this.protocol === "WS-Fed") {
+      queries = [
+        { name: 'wresult', collection: this.get, action: returnValueAsIs, to: result => this.saml = result },
+        { name: 'wresult', collection: this.post, action: returnValueAsIs, to: result => this.saml = result }
+      ];
     }
 
-    if (msg == null) {
-      msg = findParameter('SAMLart', this.get);
-    }
-    if (msg != null) {
-      this.samlart = msg;
-      return;
-    }
+    const findParameter = (name, collection) => {
+      let parameter = collection ? collection.find(item => item[0] === name) : null;
+      return parameter ? parameter[1] : null;
+    };
 
-    msg = findParameter('SAMLRequest', this.post);
-    if (msg == null) {
-      msg = findParameter('SAMLResponse', this.post);
-    }
-    if (msg != null) {
-      msg = msg.replace(/\s/g, '');
-      this.saml = atob(msg);
-      return;
-    }
-
-    if (msg == null) {
-      msg = findParameter('SAMLart', this.post);
-    }
-    if (msg != null) {
-      this.samlart = msg;
-      return;
-    }
-
-    this.saml = null;
+    return queries.some(query => {
+      let parameter = findParameter(query.name, query.collection);
+      let value = query.action(parameter);
+      query.to(value);
+      return value !== null;
+    });
   }
 };
 
@@ -283,9 +337,12 @@ SAMLTrace.RequestItem = function(request) {
   }
   if (this.request.saml != null || this.request.samlart != null) {
     this.availableTabs.push('SAML');
+    this.availableTabs.push('Summary');
   }
 };
 SAMLTrace.RequestItem.prototype = {
+  'shortPadding' :  28,
+  'longPadding'  :  70,
 
   'showHTTP' : function(target) {
     var doc = target.ownerDocument;
@@ -342,6 +399,77 @@ SAMLTrace.RequestItem.prototype = {
     }
     target.appendChild(doc.createTextNode(samlFormatted));
   },
+  
+  'showSummary' : function(target) {
+    var doc = target.ownerDocument;
+    var samlSummary = "";
+    var parser  = new DOMParser();
+    var xmldoc  = parser.parseFromString(this.request.saml,"text/xml");
+
+    /* Check for AuthnRequest */
+    var AuthnRequest = xmldoc.getElementsByTagNameNS('*','AuthnRequest');
+    if (AuthnRequest.length>0) {
+        samlSummary += 'AuthnRequest: \n';
+        if (AuthnRequest[0].attributes['Destination'])                 { samlSummary += this.summaryAdd(AuthnRequest[0].attributes['Destination'].value                , 'Destination'                ); }
+        if (AuthnRequest[0].attributes['ForceAuthn'])                  { samlSummary += this.summaryAdd(AuthnRequest[0].attributes['ForceAuthn'].value                 , 'ForceAuthn'                 ); }
+        if (AuthnRequest[0].attributes['AssertionConsumerServiceURL']) { samlSummary += this.summaryAdd(AuthnRequest[0].attributes['AssertionConsumerServiceURL'].value, 'AssertionConsumerServiceURL'); }
+    }
+    
+    /* Check for Issuer*/
+    var Issuer = xmldoc.getElementsByTagNameNS('*','Issuer');
+    if (Issuer.length>0) { 
+        samlSummary += this.summaryAdd(Issuer[0].textContent,'Issuer');
+    }
+
+    /* Check for Subject */
+    var Subject = xmldoc.getElementsByTagNameNS('*','Subject');
+    if (Subject.length>0) {
+        samlSummary += this.summaryAdd(Subject[0].textContent,'Subject');
+    }
+
+    /* Check for NameID */
+    var NameID = xmldoc.getElementsByTagNameNS('*','NameID');
+    if (NameID.length>0) {
+        samlSummary += this.summaryAdd(NameID[0].textContent,'NameID');
+    }
+    /* Check for AttributeStatement */
+    var AttributeStatement = xmldoc.getElementsByTagNameNS('*','AttributeStatement');
+    if (AttributeStatement.length>0) {
+        var AttributeStatementChilds = AttributeStatement[0].childNodes;
+        if (AttributeStatementChilds.length>0) { 
+            samlSummary += "\nAttributeStatement:\n";}
+        for (i = 0; i < AttributeStatementChilds.length; i++) {
+            var attribute = AttributeStatementChilds[i];
+            var attributeName = attribute.getAttribute('Name');
+            for (j = 0; j<attribute.childNodes.length; j++) {
+                    samlSummary += this.summaryAdd(attribute.childNodes[j].textContent,attributeName,' * ',this.longPadding);
+            }
+        }
+    }
+    
+    /* Check for LogoutRequest */
+    var LogoutRequest = xmldoc.getElementsByTagNameNS('*','LogoutRequest');
+    if (LogoutRequest.length>0) {
+        samlSummary += 'LogoutRequest: \n';
+        if (AuthnRequest[0].attributes['Destination']) { 
+          samlSummary += this.summaryAddAttVal(AuthnRequest[0].attributes['Destination'].value,'Destination');
+        }
+    }
+    
+
+    target.appendChild(doc.createTextNode(samlSummary));
+  },
+  
+  'summaryAdd' : function(value,description,decorator='',padLen=this.shortPadding) {
+    let s="";
+    if (value) {
+      s += (decorator+description).padEnd(padLen," ");
+      s += "= "+value;
+      s += "\n";
+    }
+    return s;
+  },
+
 
   'showContent' : function(target, type) {
     target.innerText = "";
@@ -354,6 +482,9 @@ SAMLTrace.RequestItem.prototype = {
       break;
     case 'SAML':
       this.showSAML(target);
+      break;
+    case 'Summary':
+      this.showSummary(target);
       break;
     }
   },
@@ -373,16 +504,27 @@ SAMLTrace.RequestItem.prototype = {
 
     var hbox = document.createElement("div");
     hbox.setAttribute('flex', '1');
-    var uniqueRequestId = new SAMLTrace.UniqueRequestId(this.request.requestId, this.request.url);
+    var uniqueRequestId = new SAMLTrace.UniqueRequestId(this.request.requestId, this.request.method, this.request.url);
     uniqueRequestId.create(id => hbox.setAttribute('id', id));
     hbox.setAttribute('class', 'list-row');
     hbox.appendChild(methodLabel);
     hbox.appendChild(urlLabel);
 
-    if (this.request.saml || this.request.samlart) {
-      var samlLogo = document.createElement("div");
-      samlLogo.classList.add("saml-logo");
-      hbox.appendChild(samlLogo);
+    if (this.request.protocol) {
+      const appendLogoDiv = (target, logoName) => {
+        let logo = document.createElement("div");
+        logo.classList.add(logoName);
+        target.appendChild(logo);
+      };
+
+      // add the protocol-logo (SAML or WS-Federation)
+      let logoName = this.request.protocol === "SAML-P" ? "saml-logo" : "ws-fed-logo";
+      appendLogoDiv(hbox, logoName);
+
+      // if the protocol is WS-Federation and a SAML-token is present, then an additional SAML-logo should be appended
+      if (this.request.protocol === "WS-Fed" && (this.request.saml || this.request.samlart)) {
+        appendLogoDiv(hbox, "saml-logo");
+      }
     }
 
     hbox.requestItem = this;
@@ -398,6 +540,7 @@ SAMLTrace.TraceWindow = function() {
   this.pauseTracing = false;
   this.autoScroll = true;
   this.filterResources = true;
+  this.colorizeRequests = true;
 };
 
 SAMLTrace.TraceWindow.prototype = {
@@ -492,53 +635,72 @@ SAMLTrace.TraceWindow.prototype = {
     this.updateStatusBar();
   },
 
+  'setColorizeRequests' : function(colorizeRequests) {
+    this.colorizeRequests = colorizeRequests;
+  },
+
   'updateStatusBar' : function() {
     var hiddenElementsString = "";
     if (this.filterResources) {
-      hiddenElementsString = ` (${this.httpRequests.filter(req => !req.isVisible).length} hidden)`;
+      hiddenElementsString = ` (${this.httpRequests.filter(req => typeof req.isVisible !== "undefined" && !req.isVisible).length} hidden)`;
     }
     var status = `${this.httpRequests.length} requests received ${hiddenElementsString}`;
     var statusItem = document.getElementById('statuspanel');
     statusItem.innerText = status;
   },
 
+  'reviseRedirectedRequestMethod' : function(request, id) {
+    const isRedirected = requestId => {
+      let parentRequest = this.httpRequests.find(r => r.req.requestId === requestId);
+      return parentRequest && parentRequest.res && (parentRequest.res.statusCode === 302 || parentRequest.res.statusCode === 303);
+    };
+
+    // There are two cases which require SAML-tracer to manually revise the captured HTTP method of a traced request:
+    //
+    // * Case 1 (HTTP StatusCode 302): The webRequest-API seems to keep the HTTP verb which was used by the parent request. This
+    //   is correct in resepct to RFC 2616 but differs from a typical browser behaviour which will usually change the POST to a GET.
+    //   So do we here... See: https://github.com/UNINETT/SAML-tracer/pull/23#issuecomment-345540591
+    //
+    // * Case 2 (HTTP StatusCode 303): RFC 2616 says a 303 should be followed by using a GET. Unfortunately Firefox's webRequest-
+    //   API-implementation acts differently in this case. It follows such redirects by using a POST. Chrome's webRequest-API-
+    //   implementation acts correct and uses a GET. Hence for Firefox clients the method will be revised here.
+    if (request.method === 'POST' && isRedirected(request.requestId)) {
+      request.method = 'GET';
+      id = id.replace('POST', 'GET');
+    }
+    return { id: id, request: request };
+  },
+
   'saveNewRequest' : function(request) { // onBeforeRequest
+    if (request.requestId.startsWith("fakeRequest-")) {
+      // Skip tracing fake requests that are issued by firefox for e.g. thumbnails of websites from about:blank
+      return;
+    }
+
     let tracer = SAMLTrace.TraceWindow.instance();
     if (tracer.pauseTracing) {
       // Skip tracing new requests
       return;
     }
 
-    var uniqueRequestId = new SAMLTrace.UniqueRequestId(request.requestId, request.url);
+    var uniqueRequestId = new SAMLTrace.UniqueRequestId(request.requestId, request.method, request.url);
     uniqueRequestId.create(id => {
-      var isRedirected = function(requestId) {
-        var parentRequest = tracer.httpRequests.find(r => r.req.requestId === requestId);
-        if (parentRequest != null && parentRequest.res != null && parentRequest.res.statusCode === 302) {
-          return true;
-        }
-        return false;
-      };
-
-      // The webRequest-API seems to keep the HTTP verbs which is correct in resepct to RFC 2616 but
-      // differs from a typical browser behaviour which will usually change the POST to a GET. So do we here...
-      // see: https://github.com/UNINETT/SAML-tracer/pull/23#issuecomment-345540591
-      if (request.method === 'POST' && isRedirected(request.requestId)) {
-        console.log(`Redirected 302-request '${id}' is a POST but is here changed to a GET to conform to browser behaviour...`);
-        request.method = 'GET';
-      }
-
-      var entry = {
-        id: id,
-        req: request
-      };
+      // Maybe revise the HTTP method on redirected requests
+      let alterationResult = tracer.reviseRedirectedRequestMethod(request, id);
+      let entry = { id: alterationResult.id, req: alterationResult.request };
       tracer.httpRequests.push(entry);
     });
   },
 
   'attachHeadersToRequest' : function(request) { // onBeforeSendHeaders
-    let uniqueRequestId = new SAMLTrace.UniqueRequestId(request.requestId, request.url);
+    let uniqueRequestId = new SAMLTrace.UniqueRequestId(request.requestId, request.method, request.url);
     uniqueRequestId.create(id => {
       let tracer = SAMLTrace.TraceWindow.instance();
+
+      // Maybe revise the HTTP method on redirected requests
+      let alterationResult = tracer.reviseRedirectedRequestMethod(request, id);
+      id = alterationResult.id;
+
       let entry = tracer.httpRequests.find(req => req.id === id);
       if (!entry) {
         // Skip further execution if no precedingly issued request can be found. This may occur, if tracing
@@ -553,9 +715,14 @@ SAMLTrace.TraceWindow.prototype = {
   },
 
   'attachResponseToRequest' : function(response) { // onHeadersReceived
-    let uniqueRequestId = new SAMLTrace.UniqueRequestId(response.requestId, response.url);
+    let uniqueRequestId = new SAMLTrace.UniqueRequestId(response.requestId, response.method, response.url);
     uniqueRequestId.create(id => {
       let tracer = SAMLTrace.TraceWindow.instance();
+
+      // Maybe revise the HTTP method on redirected requests
+      let alterationResult = tracer.reviseRedirectedRequestMethod(response, id);
+      id = alterationResult.id;
+
       let entry = tracer.httpRequests.find(req => req.id === id);
       if (!entry) {
         // Skip further execution if no precedingly issued request can be found. This may occur, if tracing
@@ -587,6 +754,14 @@ SAMLTrace.TraceWindow.prototype = {
         var isVisible = tracer.isRequestVisible(response);
         if (!isVisible) {
           requestDiv.classList.add("isRessource");
+          
+          if (!tracer.filterResources) {
+            requestDiv.classList.add("displayAnyway");
+          }
+        }
+
+        if (!tracer.colorizeRequests) {
+          requestDiv.classList.add("monochrome");
         }
         
         entry.isVisible = isVisible;
@@ -618,6 +793,8 @@ SAMLTrace.TraceWindow.prototype = {
   },
 
   'showRequest' : function(requestItem) {
+    var requestInfoTabbox = document.getElementById('request-info-tabbox');
+    requestInfoTabbox.innerText = "";
     var requestInfoContent = document.getElementById('request-info-content');
     if (requestItem === null) {
       requestInfoContent.innerText = "";
@@ -625,8 +802,6 @@ SAMLTrace.TraceWindow.prototype = {
     }
     this.requestItem = requestItem;
 
-    var requestInfoTabbox = document.getElementById('request-info-tabbox');
-    requestInfoTabbox.innerText = "";
     for (var i = 0; i < requestItem.availableTabs.length; i++) {
       var name = requestItem.availableTabs[i];
       this.addRequestTab(name, requestInfoTabbox, requestInfoContent);
@@ -671,8 +846,21 @@ SAMLTrace.TraceWindow.prototype = {
 };
 
 SAMLTrace.TraceWindow.init = function() {
+  var browser = browser || chrome;
   let traceWindow = new SAMLTrace.TraceWindow();
-  
+
+  let isFirefox = () => {
+    return typeof InstallTrigger !== 'undefined';
+  }
+
+  let getOnBeforeSendHeadersExtraInfoSpec = () => {
+    return isFirefox() ? ["blocking", "requestHeaders"] : ["blocking", "requestHeaders", "extraHeaders"];
+  };
+
+  let getOnHeadersReceivedExtraInfoSpec = () => {
+    return isFirefox() ? ["blocking", "responseHeaders"] : ["blocking", "responseHeaders", "extraHeaders"];
+  };
+
   browser.webRequest.onBeforeRequest.addListener(
     traceWindow.saveNewRequest,
     {urls: ["<all_urls>"]},
@@ -682,13 +870,13 @@ SAMLTrace.TraceWindow.init = function() {
   browser.webRequest.onBeforeSendHeaders.addListener(
     traceWindow.attachHeadersToRequest,
     {urls: ["<all_urls>"]},
-    ["blocking", "requestHeaders"]
+    getOnBeforeSendHeadersExtraInfoSpec()
   );
 
   browser.webRequest.onHeadersReceived.addListener(
     traceWindow.attachResponseToRequest,
     {urls: ["<all_urls>"]},
-    ["blocking", "responseHeaders"]
+    getOnHeadersReceivedExtraInfoSpec()
   );
 };
 
